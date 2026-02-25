@@ -1,5 +1,5 @@
 // ========================================
-// SMS ALERTS - TextBee Gateway Integration
+// SMS ALERTS - Node.js / Render.com Version
 // Bangus Pond Water Quality Monitor
 // ========================================
 // ALERT RULES:
@@ -9,10 +9,10 @@
 //   WARNING → CRITICAL     → SMS immediately (escalation), then every 1 min
 //   CRITICAL → WARNING     → SMS immediately (downgrade), then every 5 mins
 //   SAFE reached           → SMS once (recovery), intervals cleared
-//
-//   Severity changes always bypass any running interval and send immediately.
 // ========================================
 
+const admin = require('firebase-admin');
+const fetch = require('node-fetch');
 
 // ── CONFIG ───────────────────────────────────────────────────────────────────
 const SMS_CONFIG = {
@@ -20,11 +20,12 @@ const SMS_CONFIG = {
   deviceId: '6995c765f8dad099dc719666',  // From textbee.dev dashboard
   baseUrl:  'https://api.textbee.dev/api/v1',
 
+
   // Phone numbers that will receive SMS alerts (Philippine format)
   recipients: [
-    '+639686546079',
-    // '+63XXXXXXXXXX', // Uncomment to add more
-  ],
+    process.env.SMS_RECIPIENT_1,            // Set in Render.com environment variables
+    // Add more recipients via environment variables if needed
+  ].filter(Boolean), // removes undefined entries if not set
 
   // How often to repeat SMS while the parameter stays in each severity
   repeatIntervalMs: {
@@ -35,9 +36,31 @@ const SMS_CONFIG = {
   // Send an SMS when a parameter returns to safe range
   sendRecoverySms: true,
 
-  // Firebase path for SMS send logs (prevents duplicate sends on page reload)
+  // Firebase path for SMS send logs (prevents duplicate sends on restart)
   smsLogPath: 'smsAlerts/log',
 };
+// ─────────────────────────────────────────────────────────────────────────────
+
+
+// ── FIREBASE ADMIN INIT ───────────────────────────────────────────────────────
+// Service account key is stored as an environment variable on Render.com
+// We parse it from the FIREBASE_SERVICE_ACCOUNT env variable (JSON string)
+try {
+  const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+    databaseURL: 'https://prototypefishda-default-rtdb.asia-southeast1.firebasedatabase.app'
+  });
+
+  console.log('[SMS] Firebase Admin SDK initialized successfully.');
+} catch (error) {
+  console.error('[SMS] Failed to initialize Firebase Admin SDK:', error.message);
+  console.error('[SMS] Make sure FIREBASE_SERVICE_ACCOUNT environment variable is set correctly.');
+  process.exit(1); // Stop the process if Firebase fails to initialize
+}
+
+const db = admin.database();
 // ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -47,49 +70,39 @@ const SMS_CONFIG = {
   {
     [parameter]: {
       severity:    'warning' | 'critical' | null,
-      alertId:     string,       // current Firebase alert ID
+      alertId:     string,
       value:       string,
       threshold:   string,
       message:     string,
-      intervalId:  number|null,  // setInterval handle for repeat SMS
-      lastSentAt:  number,       // timestamp of last SMS sent
+      intervalId:  number|null,
+      lastSentAt:  number,
     }
   }
 */
 const _paramState = {};
 
-// IDs already sent an SMS for (loaded from Firebase on init, survives reload)
+// Alert IDs already sent SMS for (loaded from Firebase on start, survives restart)
 const _sentAlertIds = new Set();
-
-let _smsInitialized = false;
 // ─────────────────────────────────────────────────────────────────────────────
 
 
 // ── INIT ──────────────────────────────────────────────────────────────────────
 function initSmsAlerts() {
-  if (_smsInitialized) return;
-  _smsInitialized = true;
+  console.log('[SMS] Starting SMS alert service...');
 
-  if (typeof firebase === 'undefined' || !firebase.database) {
-    console.error('[SMS] Firebase not available. SMS alerts disabled.');
-    return;
-  }
-
-  console.log('[SMS] Initializing SMS alert system...');
-
-  // Load sent log first so we don't re-send on page reload, then watch alerts
+  // Load sent log first to avoid re-sending on restart, then watch alerts
   _loadSentLog().then(() => {
     _watchActiveAlerts();
-    console.log('[SMS] SMS alert system ready.');
+    console.log('[SMS] SMS alert service is running. Watching for alerts...');
   });
 }
 
 /**
- * Load previously sent alert IDs from Firebase into _sentAlertIds.
- * Only last 500 entries to keep it lightweight.
+ * Load previously sent alert IDs from Firebase into memory.
+ * Prevents duplicate SMS when the service restarts.
  */
 function _loadSentLog() {
-  return firebase.database()
+  return db
     .ref(SMS_CONFIG.smsLogPath)
     .orderByChild('sentAt')
     .limitToLast(500)
@@ -114,22 +127,18 @@ function _loadSentLog() {
 
 // ── FIREBASE LISTENER ────────────────────────────────────────────────────────
 function _watchActiveAlerts() {
-  const activeRef = firebase.database().ref('alerts/active');
+  const activeRef = db.ref('alerts/active');
 
-  // child_added fires for existing nodes on first listen, then for truly new ones.
-  // _sentAlertIds prevents re-sending for alerts that were active before page reload.
   activeRef.on('child_added', (snapshot) => {
     const alert = { id: snapshot.key, ...snapshot.val() };
     _onAlertAddedOrChanged(alert, false);
   });
 
-  // child_changed fires when alerts.js updates value/severity on an existing alert
   activeRef.on('child_changed', (snapshot) => {
     const alert = { id: snapshot.key, ...snapshot.val() };
     _onAlertAddedOrChanged(alert, true);
   });
 
-  // child_removed fires when an alert is acknowledged, dismissed, or auto-resolved
   activeRef.on('child_removed', (snapshot) => {
     const alert = { id: snapshot.key, ...snapshot.val() };
     _onAlertRemoved(alert);
@@ -139,13 +148,6 @@ function _watchActiveAlerts() {
 
 
 // ── CORE ALERT HANDLER ───────────────────────────────────────────────────────
-/**
- * Called when an alert is added or its severity/value changes.
- * Decides whether to send immediately and how to schedule repeats.
- *
- * @param {object}  alert     - The alert data from Firebase
- * @param {boolean} isUpdate  - true if this is a child_changed event
- */
 function _onAlertAddedOrChanged(alert, isUpdate) {
   const { id, parameter, severity, value, threshold, message } = alert;
   const prev = _paramState[parameter];
@@ -153,11 +155,10 @@ function _onAlertAddedOrChanged(alert, isUpdate) {
   const prevSeverity = prev ? prev.severity : null;
   const severityChanged = prevSeverity !== severity;
 
-  // ── Case 1: Page reload — alert already existed before reload ───────────
-  // _sentAlertIds has the ID but we have no interval running.
+  // ── Case 1: Service restarted — alert already existed before restart ────
   // Restore state silently and restart the repeat interval without sending SMS.
   if (_sentAlertIds.has(id) && !prev) {
-    console.log(`[SMS] Restoring state for "${parameter}" (${severity}) after reload.`);
+    console.log(`[SMS] Restoring state for "${parameter}" (${severity}) after restart.`);
     _paramState[parameter] = {
       severity, alertId: id, value, threshold, message,
       intervalId: null, lastSentAt: Date.now(),
@@ -176,8 +177,7 @@ function _onAlertAddedOrChanged(alert, isUpdate) {
     return;
   }
 
-  // ── Case 3: Severity changed (escalation or downgrade) ─────────────────
-  // OR brand new alert for this parameter.
+  // ── Case 3: Severity changed or brand new alert ─────────────────────────
   // Always send immediately and restart the interval for the new severity.
   const reason = !prev
     ? `entered ${severity}`
@@ -191,7 +191,7 @@ function _onAlertAddedOrChanged(alert, isUpdate) {
   // Update state
   _paramState[parameter] = {
     severity, alertId: id, value, threshold, message,
-    intervalId: null, lastSentAt: 0, // 0 forces send in _sendAlertSms
+    intervalId: null, lastSentAt: 0,
   };
 
   // Send immediately then start repeating
@@ -199,12 +199,8 @@ function _onAlertAddedOrChanged(alert, isUpdate) {
   _startRepeatInterval(parameter);
 }
 
-/**
- * Called when an alert is removed (resolved, acknowledged, or dismissed).
- */
 function _onAlertRemoved(alert) {
   const { parameter } = alert;
-  const prev = _paramState[parameter];
 
   // Clear the repeat interval immediately
   _clearRepeatInterval(parameter);
@@ -214,8 +210,7 @@ function _onAlertRemoved(alert) {
 
   // Wait 3s to confirm the parameter isn't immediately re-alerting
   setTimeout(() => {
-    firebase.database()
-      .ref('alerts/active')
+    db.ref('alerts/active')
       .orderByChild('parameter')
       .equalTo(parameter)
       .once('value')
@@ -234,10 +229,6 @@ function _onAlertRemoved(alert) {
 
 
 // ── INTERVAL MANAGEMENT ───────────────────────────────────────────────────────
-/**
- * Start a repeating SMS interval based on the parameter's current severity.
- * CRITICAL = every 1 min, WARNING = every 5 mins.
- */
 function _startRepeatInterval(parameter) {
   const state = _paramState[parameter];
   if (!state) return;
@@ -248,33 +239,29 @@ function _startRepeatInterval(parameter) {
   console.log(`[SMS] Starting repeat interval for "${parameter}" (${state.severity}): every ${intervalMs / 60000} min.`);
 
   state.intervalId = setInterval(() => {
-    // Re-check state is still valid (could have been cleared by removal)
     const current = _paramState[parameter];
     if (!current) {
       clearInterval(state.intervalId);
       return;
     }
 
-    // Verify the parameter is still at the same severity in Firebase before sending
-    firebase.database()
-      .ref('alerts/active')
+    // Verify still active in Firebase before sending
+    db.ref('alerts/active')
       .orderByChild('parameter')
       .equalTo(parameter)
       .once('value')
       .then((snap) => {
         if (!snap.exists()) {
-          // Alert was resolved between intervals
           _clearRepeatInterval(parameter);
           delete _paramState[parameter];
           return;
         }
 
-        // Confirm severity hasn't changed since interval was set up
+        // Confirm severity hasn't changed
         let currentSeverity = null;
         snap.forEach((child) => { currentSeverity = child.val().severity; });
 
         if (currentSeverity !== current.severity) {
-          // Severity changed — child_changed will handle it, skip this tick
           console.log(`[SMS] Severity changed for "${parameter}" during interval tick — skipping.`);
           return;
         }
@@ -285,9 +272,6 @@ function _startRepeatInterval(parameter) {
   }, intervalMs);
 }
 
-/**
- * Clear and nullify the repeat interval for a parameter.
- */
 function _clearRepeatInterval(parameter) {
   const state = _paramState[parameter];
   if (state && state.intervalId !== null) {
@@ -300,9 +284,6 @@ function _clearRepeatInterval(parameter) {
 
 
 // ── SMS SENDING ───────────────────────────────────────────────────────────────
-/**
- * Build and send an alert SMS for a parameter, then log it.
- */
 function _sendAlertSms(parameter, reason) {
   const state = _paramState[parameter];
   if (!state) return;
@@ -319,23 +300,19 @@ function _sendAlertSms(parameter, reason) {
   });
 }
 
-/**
- * Send an SMS via TextBee to all configured recipients.
- * Returns Promise<boolean>.
- */
 async function _sendSms(message) {
   const { apiKey, deviceId, baseUrl, recipients } = SMS_CONFIG;
 
-  if (!apiKey || apiKey === 'YOUR_TEXTBEE_API_KEY') {
-    console.warn('[SMS] TextBee API key not configured.');
+  if (!apiKey) {
+    console.warn('[SMS] TEXTBEE_API_KEY environment variable not set.');
     return false;
   }
-  if (!deviceId || deviceId === 'YOUR_TEXTBEE_DEVICE_ID') {
-    console.warn('[SMS] TextBee device ID not configured.');
+  if (!deviceId) {
+    console.warn('[SMS] TEXTBEE_DEVICE_ID environment variable not set.');
     return false;
   }
-  if (!recipients || recipients.length === 0 || recipients[0] === '+63XXXXXXXXXX') {
-    console.warn('[SMS] No recipients configured.');
+  if (!recipients || recipients.length === 0) {
+    console.warn('[SMS] SMS_RECIPIENT_1 environment variable not set.');
     return false;
   }
 
@@ -354,7 +331,7 @@ async function _sendSms(message) {
     const data = await response.json();
 
     if (response.ok) {
-      console.log('[SMS] ✅ SMS sent successfully:', data);
+      console.log('[SMS] ✅ SMS sent successfully.');
       return true;
     } else {
       console.error('[SMS] ❌ TextBee API error:', response.status, data);
@@ -378,12 +355,11 @@ function _buildAlertMessage(parameter, severity, value, threshold, message, reas
     hour: '2-digit', minute: '2-digit',
   });
 
-  // Context line describes WHY the SMS is being sent
   let contextLine = '';
   if (reason && reason.includes('→')) {
     contextLine = `Status changed: ${reason}\n`;
   } else if (reason && reason.startsWith('still')) {
-    contextLine = `⚠️ Still ${severity} — situation ongoing.\n`;
+    contextLine = `Still ${severity} — situation ongoing.\n`;
   } else {
     contextLine = `Alert triggered.\n`;
   }
@@ -438,69 +414,32 @@ function _getParamUnit(parameter) {
 
 
 // ── FIREBASE LOG HELPER ───────────────────────────────────────────────────────
-/**
- * Record that an SMS was sent for this alert ID so it's skipped on page reload.
- */
 function _markAsSent(alertId, parameter, severity) {
   _sentAlertIds.add(alertId);
 
-  firebase.database()
-    .ref(SMS_CONFIG.smsLogPath)
+  db.ref(SMS_CONFIG.smsLogPath)
     .push({ alertId, parameter, severity, sentAt: Date.now() })
     .catch((err) => console.warn('[SMS] Could not write to SMS log:', err));
 }
 // ─────────────────────────────────────────────────────────────────────────────
 
 
-// ── PUBLIC API ────────────────────────────────────────────────────────────────
-/**
- * Send a test SMS to verify your TextBee setup.
- * Call from browser console: testSmsSend()
- */
-function testSmsSend() {
-  console.log('[SMS] Sending test SMS...');
-  _sendSms(
-    '[BANGUS POND - TEST]\n' +
-    '✅ SMS alert system is working correctly.\n' +
-    'This is a test message from your monitoring system.'
-  ).then((success) => {
-    if (success) console.log('[SMS] Test SMS sent! Check your phone.');
-    else         console.error('[SMS] Test SMS failed. Check API key and device ID.');
-  });
-}
+// ── KEEP PROCESS ALIVE ────────────────────────────────────────────────────────
+// Catch unhandled errors so the service doesn't crash silently
+process.on('uncaughtException', (error) => {
+  console.error('[SMS] Uncaught exception:', error);
+});
 
-/**
- * Update recipients at runtime without reloading.
- * Example: setSmsRecipients(['+63912XXXXXXX'])
- */
-function setSmsRecipients(numbers) {
-  SMS_CONFIG.recipients = numbers;
-  console.log('[SMS] Recipients updated:', numbers);
-}
+process.on('unhandledRejection', (reason) => {
+  console.error('[SMS] Unhandled promise rejection:', reason);
+});
 
-/**
- * View current per-parameter alert state (for debugging).
- * Call from browser console: getSmsState()
- */
-function getSmsState() {
-  console.table(
-    Object.entries(_paramState).map(([param, s]) => ({
-      parameter:    param,
-      severity:     s.severity,
-      value:        s.value,
-      intervalActive: s.intervalId !== null,
-      lastSentAgo:  s.lastSentAt ? Math.round((Date.now() - s.lastSentAt) / 1000) + 's ago' : 'never',
-    }))
-  );
-}
+// Log that the service is still alive every hour
+setInterval(() => {
+  console.log('[SMS] Service is running. Active parameters:', Object.keys(_paramState).length > 0 ? Object.keys(_paramState).join(', ') : 'none');
+}, 60 * 60 * 1000);
 // ─────────────────────────────────────────────────────────────────────────────
 
 
-// ── AUTO-START ────────────────────────────────────────────────────────────────
-if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', initSmsAlerts);
-} else {
-  initSmsAlerts();
-}
-
-console.log('[SMS] smsAlerts.js loaded.');
+// ── START ─────────────────────────────────────────────────────────────────────
+initSmsAlerts();
