@@ -1,1 +1,11 @@
+# Never upload these to GitHub
+serviceAccountKey.json
+*.json.key
+.env
 
+# Node modules (too large, installed automatically)
+node_modules/
+
+# Logs
+*.log
+npm-debug.log*
