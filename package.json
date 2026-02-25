@@ -1,1 +1,13 @@
-
+{
+  "name": "bangus-sms-alerts",
+  "version": "1.0.0",
+  "description": "SMS alert service for Bangus Pond Monitor",
+  "main": "smsAlerts.js",
+  "scripts": {
+    "start": "node smsAlerts.js"
+  },
+  "dependencies": {
+    "firebase-admin": "^11.11.0",
+    "node-fetch": "^2.7.0"
+  }
+}
