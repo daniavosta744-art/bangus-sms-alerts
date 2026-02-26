@@ -16,10 +16,9 @@ const fetch = require('node-fetch');
 
 // ── CONFIG ───────────────────────────────────────────────────────────────────
 const SMS_CONFIG = {
-  apiKey:   'a01447de-9423-4c0d-bfcc-3459e2fe9075',    // From textbee.dev dashboard
-  deviceId: '6995c765f8dad099dc719666',  // From textbee.dev dashboard
+  apiKey:   process.env.TEXTBEE_API_KEY,    // Set in Render.com environment variables
+  deviceId: process.env.TEXTBEE_DEVICE_ID,  // Set in Render.com environment variables
   baseUrl:  'https://api.textbee.dev/api/v1',
-
 
   // Phone numbers that will receive SMS alerts (Philippine format)
   recipients: [
@@ -216,9 +215,10 @@ function _onAlertRemoved(alert) {
       .once('value')
       .then((snap) => {
         if (!snap.exists()) {
-          console.log(`[SMS] "${parameter}" returned to safe range. Sending recovery SMS.`);
+          console.log(`[SMS] "${parameter}" returned to safe range. Sending recovery SMS + push.`);
           const smsBody = _buildRecoveryMessage(parameter);
           _sendSms(smsBody);
+          _sendFcmRecoveryNotification(parameter);
         } else {
           console.log(`[SMS] "${parameter}" re-alerted immediately — skipping recovery SMS.`);
         }
@@ -283,6 +283,130 @@ function _clearRepeatInterval(parameter) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 
+// ── FCM PUSH NOTIFICATIONS ───────────────────────────────────────────────────
+/**
+ * Send a push notification to ALL registered browser tokens.
+ * Reads all tokens from Firebase fcmTokens/ and sends to each.
+ */
+async function _sendFcmNotification(parameter, severity, value, threshold, reason) {
+  try {
+    const paramLabel = _getParamLabel(parameter);
+    const unit       = _getParamUnit(parameter);
+    const sevLabel   = severity.toUpperCase();
+
+    // Build notification title and body matching the requested format
+    const title = `🔴 ${sevLabel}: Bangus Pond Alert`;
+    const body  = [
+      `${severity}: ${paramLabel} is on ${severity} level`,
+      `Parameter: ${paramLabel}`,
+      `Value: ${value} ${unit}`,
+    ].join('\n');
+
+    // Load all FCM tokens from Firebase
+    const snapshot = await db.ref('fcmTokens').once('value');
+
+    if (!snapshot.exists()) {
+      console.log('[FCM] No registered tokens found — skipping push notification.');
+      return;
+    }
+
+    const messages = [];
+    snapshot.forEach((userSnapshot) => {
+      userSnapshot.forEach((tokenSnapshot) => {
+        const data = tokenSnapshot.val();
+        if (data && data.token) {
+          messages.push(
+            admin.messaging().send({
+              token: data.token,
+              notification: { title, body },
+              webpush: {
+                notification: {
+                  title,
+                  body,
+                  icon:  '/images/gataw.png',
+                  badge: '/images/gataw.png',
+                  tag:   'bangus-pond-alert',
+                  renotify: true,
+                  requireInteraction: false,
+                },
+              },
+            }).catch((err) => {
+              // Token is stale or invalid — remove it from Firebase
+              if (
+                err.code === 'messaging/registration-token-not-registered' ||
+                err.code === 'messaging/invalid-registration-token'
+              ) {
+                console.log(`[FCM] Removing stale token for uid: ${userSnapshot.key}`);
+                tokenSnapshot.ref.remove();
+              } else {
+                console.error('[FCM] Error sending to token:', err.message);
+              }
+            })
+          );
+        }
+      });
+    });
+
+    await Promise.all(messages);
+    console.log(`[FCM] ✅ Push notifications sent to ${messages.length} device(s) for "${parameter}" (${severity}).`);
+
+  } catch (error) {
+    console.error('[FCM] Error sending push notifications:', error.message);
+  }
+}
+
+/**
+ * Send a recovery push notification when parameter returns to safe range.
+ */
+async function _sendFcmRecoveryNotification(parameter) {
+  try {
+    const paramLabel = _getParamLabel(parameter);
+    const title = '✅ Bangus Pond - Resolved';
+    const body  = `${paramLabel} has returned to safe range.`;
+
+    const snapshot = await db.ref('fcmTokens').once('value');
+    if (!snapshot.exists()) return;
+
+    const messages = [];
+    snapshot.forEach((userSnapshot) => {
+      userSnapshot.forEach((tokenSnapshot) => {
+        const data = tokenSnapshot.val();
+        if (data && data.token) {
+          messages.push(
+            admin.messaging().send({
+              token: data.token,
+              notification: { title, body },
+              webpush: {
+                notification: {
+                  title, body,
+                  icon: '/images/gataw.png',
+                  tag:  'bangus-pond-resolved',
+                  requireInteraction: false,
+                },
+              },
+            }).catch((err) => {
+              if (
+                err.code === 'messaging/registration-token-not-registered' ||
+                err.code === 'messaging/invalid-registration-token'
+              ) {
+                tokenSnapshot.ref.remove();
+              }
+            })
+          );
+        }
+      });
+    });
+
+    await Promise.all(messages);
+    console.log(`[FCM] ✅ Recovery push notification sent for "${parameter}".`);
+
+  } catch (error) {
+    console.error('[FCM] Error sending recovery push notification:', error.message);
+  }
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
+
 // ── SMS SENDING ───────────────────────────────────────────────────────────────
 function _sendAlertSms(parameter, reason) {
   const state = _paramState[parameter];
@@ -298,6 +422,9 @@ function _sendAlertSms(parameter, reason) {
       console.log(`[SMS] ✅ Alert SMS sent for "${parameter}" (${severity}).`);
     }
   });
+
+  // Send FCM push notification to all registered browsers
+  _sendFcmNotification(parameter, severity, value, threshold, reason);
 }
 
 async function _sendSms(message) {
