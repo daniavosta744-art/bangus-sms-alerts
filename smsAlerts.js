@@ -551,20 +551,86 @@ function _markAsSent(alertId, parameter, severity) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 
-// ── KEEP PROCESS ALIVE ────────────────────────────────────────────────────────
-// Catch unhandled errors so the service doesn't crash silently
+// ── 24/7 KEEP-ALIVE TRICKS ───────────────────────────────────────────────────
+
+// ── TRICK 1: Catch all unhandled errors so the service never crashes silently ─
 process.on('uncaughtException', (error) => {
-  console.error('[SMS] Uncaught exception:', error);
+  console.error('[SMS] Uncaught exception (kept alive):', error);
+  // Do NOT call process.exit() — let the service keep running
 });
 
 process.on('unhandledRejection', (reason) => {
-  console.error('[SMS] Unhandled promise rejection:', reason);
+  console.error('[SMS] Unhandled promise rejection (kept alive):', reason);
+  // Do NOT call process.exit() — let the service keep running
 });
 
-// Log that the service is still alive every hour
+// ── TRICK 2: HTTP server so Render doesn't time out ──────────────────────────
+// Render Web Service requires an open port. This dummy server satisfies that.
+const http = require('http');
+const PORT = process.env.PORT || 3000;
+
+const server = http.createServer((req, res) => {
+  // Simple health check endpoint — useful for uptime monitors
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({
+    status:     'running',
+    service:    'Bangus Pond SMS Alert Service',
+    uptime:     Math.floor(process.uptime()) + 's',
+    active:     Object.keys(_paramState).length,
+    parameters: Object.keys(_paramState),
+    timestamp:  new Date().toISOString(),
+  }));
+});
+
+server.listen(PORT, () => {
+  console.log(`[SMS] HTTP server listening on port ${PORT}.`);
+});
+
+// ── TRICK 3: Self-ping every 10 minutes to prevent Render spin-down ──────────
+// Render free tier spins down after ~15 mins of no traffic.
+// Pinging our own URL every 10 mins keeps it awake 24/7.
+const RENDER_URL = process.env.RENDER_EXTERNAL_URL;
+
+if (RENDER_URL) {
+  console.log(`[SMS] Self-ping enabled. Will ping ${RENDER_URL} every 10 minutes.`);
+
+  setInterval(async () => {
+    try {
+      const res = await fetch(RENDER_URL);
+      console.log(`[SMS] Self-ping OK (${res.status}) — service is awake.`);
+    } catch (err) {
+      console.warn('[SMS] Self-ping failed:', err.message);
+    }
+  }, 10 * 60 * 1000); // every 10 minutes
+
+} else {
+  console.warn('[SMS] RENDER_EXTERNAL_URL not set — self-ping disabled. Add it as an environment variable on Render.');
+}
+
+// ── TRICK 4: Heartbeat log every hour so you can confirm it's still running ──
 setInterval(() => {
-  console.log('[SMS] Service is running. Active parameters:', Object.keys(_paramState).length > 0 ? Object.keys(_paramState).join(', ') : 'none');
-}, 60 * 60 * 1000);
+  const uptime  = Math.floor(process.uptime());
+  const hours   = Math.floor(uptime / 3600);
+  const minutes = Math.floor((uptime % 3600) / 60);
+  const active  = Object.keys(_paramState);
+
+  console.log(
+    `[SMS] ❤️  Heartbeat — Uptime: ${hours}h ${minutes}m | ` +
+    `Active alerts: ${active.length > 0 ? active.join(', ') : 'none'}`
+  );
+}, 60 * 60 * 1000); // every hour
+
+// ── TRICK 5: Firebase reconnection watchdog ───────────────────────────────────
+// If Firebase connection drops (network blip), this detects it and logs a warning.
+// Firebase Admin SDK reconnects automatically, but this helps with debugging.
+db.ref('.info/connected').on('value', (snap) => {
+  if (snap.val() === true) {
+    console.log('[SMS] ✅ Firebase connected.');
+  } else {
+    console.warn('[SMS] ⚠️  Firebase disconnected — will reconnect automatically.');
+  }
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 
